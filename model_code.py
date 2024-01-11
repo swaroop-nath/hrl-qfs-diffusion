@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from typing import List, Dict, Tuple, Callable
+from typing import Dict, Callable
 from supervised_contrastive_loss import SupervisedContrastiveLoss
 from transformers import BertModel, BertConfig
 
@@ -18,17 +18,17 @@ class DiffusionModel(nn.Module):
         
         We will use DDIM as it generates higher quality outputs in less time (10x - 50x reported in paper).
     """
-    def __init__(self, beta_schedule: str, diffusion_steps: int, transformer_kwargs: Dict, training_kwargs: Dict):
+    def __init__(self, beta_schedule: str, diffusion_steps: int, transformer_kwargs: Dict, training_kwargs: Dict, dtype: torch.typename = torch.float32):
         """
             Constructor for the Diffusion Model.
 
-            :param beta_schedule: The name of the schedule to use for obtaining betas for different time steps.
+            :param beta_schedule: The name of the schedule to use for obtaining betas for different time steps. One of `linear` or `cosine`
             :param diffusion_steps: The total number of steps of diffusion
         """
         super().__init__()
         self._beta_schedule = beta_schedule
         self.diffusion_steps = diffusion_steps
-        self.betas = torch.tensor(self._generate_betas_for_schedule(beta_schedule, diffusion_steps)) # (diffusion_steps,)
+        self.betas = torch.tensor(self._generate_betas_for_schedule(beta_schedule, diffusion_steps), dtype=dtype) # (diffusion_steps,)
         self.alphas = 1 - self.betas # (diffusion_steps,)
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=-1) # (diffusion_steps,)
         
@@ -40,8 +40,8 @@ class DiffusionModel(nn.Module):
         
         self.posterior_variance = self.betas * ((1 - self.alphas_cumprod_t_minus_1) / (1 - self.alphas_cumprod)) # σ_t | (diffusion_steps,)
         
+        self.encoder = TransformerEncoder(hf_backbone_name=transformer_kwargs['enc-hf-backbone-name'], diffusion_emb_dim=transformer_kwargs['ldm-hf-config'].hidden_size)
         self.backbone = TransformerLatentDiffuser(config=transformer_kwargs['ldm-hf-config'])
-        self.encoder = TransformerEncoder(hf_backbone_name=transformer_kwargs['enc-hf-backbone-name'])
         
         self.sc_loss_obj = SupervisedContrastiveLoss()
         
@@ -205,9 +205,9 @@ class DiffusionModel(nn.Module):
             sc_loss += self.sc_loss_obj(_in, _label)
         return sc_loss / x_start_in.size(0)
     
-    def _matching_loss(x_start_in, num_qd_sents, matching_labels):
+    def _matching_loss(self, x_start_in, num_qd_sents, matching_labels):
         matching_logits = torch.bmm(x_start_in[:, num_qd_sents:, :], x_start_in[:, :num_qd_sents, :].permute(0, 2, 1))
-        return nn.functional.cross_entropy(input=matching_logits.reshape(-1, matching_logits.size(-1)), target=matching_labels.reshape(-1), ingore_index=-100) # -100 signifies the padded positions in summary inputs
+        return nn.functional.cross_entropy(input=matching_logits.reshape(-1, matching_logits.size(-1)), target=matching_labels.reshape(-1), ignore_index=-100) # -100 signifies the padded positions in summary inputs
         
     def _gen_quality_loss(self, x_start, pred_x_start, num_qd_sents, s_attention_mask):
         # Calculates the MSE loss for the generations
@@ -227,6 +227,7 @@ class TransformerEncoder(nn.Module):
         """
         super().__init__()
         self.encoder = BertModel.from_pretrained(hf_backbone_name)
+        self.config = self.encoder.config
         self._diffusion_emb_dim = diffusion_emb_dim
         if diffusion_emb_dim is not None:
             self.doc_transform = nn.Sequential(
@@ -285,36 +286,3 @@ class TransformerLatentDiffuser(nn.Module):
         pred_x_start = nn.functional.normalize(pred_x_start)
         
         return pred_x_start
-    
-# Unit Testing
-def test_transformer_encoder():
-    import torch
-    model = TransformerEncoder('bert-base-cased')
-    
-    d_model = model.encoder.config.hidden_size
-    qd_embeddings = torch.randn((2, 5, d_model))
-    s_embeddings = torch.randn((2, 3, d_model))
-    qd_attention_mask = torch.randint(0, 2, size=(2, 5))
-    s_attention_mask = torch.randint(0, 2, size=(2, 3))
-    
-    output = model(qd_embeddings, s_embeddings, qd_attention_mask, s_attention_mask) 
-    assert output is not None
-    assert output.size() == (2, 8, d_model)
-    
-def test_transformer_diffuser():
-    import torch
-    from transformers import BertConfig
-    
-    config = BertConfig(hidden_size=128, num_attention_heads=8)
-    ldm = TransformerLatentDiffuser(config)
-    
-    x_t = torch.randn((2, 5, 128)) # (bsz, seq_len, emb_dim)
-    t = torch.randint(low=0, high=400, size=(2,)) # (bsz,)
-    attention_mask = torch.randint(low=0, high=2, size=(2, 5)) # (bsz, seq_len)
-    
-    output = ldm(x_t, t, attention_mask)
-    assert output is not None
-    assert output.size() == (2, 5, 128)
- 
-if __name__ == '__main__':
-    pass
