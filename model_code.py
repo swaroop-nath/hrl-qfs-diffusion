@@ -40,7 +40,7 @@ class DiffusionModel(nn.Module):
         
         self.posterior_variance = self.betas * ((1 - self.alphas_cumprod_t_minus_1) / (1 - self.alphas_cumprod)) # σ_t | (diffusion_steps,)
         
-        self.backbone = TransformerLatentDiffuser(hf_backbone_name=transformer_kwargs['ldm-hf-model-name'])
+        self.backbone = TransformerLatentDiffuser(config=transformer_kwargs['ldm-hf-config'])
         self.encoder = TransformerEncoder(hf_backbone_name=transformer_kwargs['enc-hf-backbone-name'])
         
         self.sc_loss_obj = SupervisedContrastiveLoss()
@@ -158,7 +158,7 @@ class DiffusionModel(nn.Module):
         q_posterior_output.update({'x_start_pred': pred_x_start})
         return q_posterior_output # The mu_t-1 acts as the x_{t-1}
     
-    def train(self, qd_embeddings, s_embeddings, t, qd_attention_mask, s_attention_mask, num_qd_sents, contrastive_labels, matching_labels):
+    def train_supervised(self, qd_embeddings, s_embeddings, t, qd_attention_mask, s_attention_mask, num_qd_sents, contrastive_labels, matching_labels):
         """
             The training loop for the Diffusion Model. The train step first performs the forward diffusion to time-step t.
             Following that it performs the DDIM based backward diffusion, which uses the predicted x_0 from the backbone. 
@@ -215,7 +215,7 @@ class DiffusionModel(nn.Module):
         return torch.mean(torch.sum(squared_error_sequence * s_attention_mask, dim=-1) / torch.sum(s_attention_mask, dim=-1)) # first mean across seq_len accounting for padding, followed by mean across batch
     
     def forward(self, qd_embeddings, s_embeddings, t, qd_attention_mask, s_attention_mask, num_qd_sents, contrastive_labels, matching_labels):
-        return self.train(qd_embeddings, s_embeddings, t, qd_attention_mask, s_attention_mask, num_qd_sents, contrastive_labels, matching_labels)
+        return self.train_supervised(qd_embeddings, s_embeddings, t, qd_attention_mask, s_attention_mask, num_qd_sents, contrastive_labels, matching_labels)
     
 class TransformerEncoder(nn.Module):
     def __init__(self, hf_backbone_name, diffusion_emb_dim=None):
@@ -225,6 +225,7 @@ class TransformerEncoder(nn.Module):
             :param hf_backbone_name: Specifies the Huggingface model code, such as `bert-base-cased`
             :param diffusion_emb_dim: Specifies the embedding dimension of the Latent Diffusion Model
         """
+        super().__init__()
         self.encoder = BertModel.from_pretrained(hf_backbone_name)
         self._diffusion_emb_dim = diffusion_emb_dim
         if diffusion_emb_dim is not None:
@@ -259,6 +260,7 @@ class TransformerLatentDiffuser(nn.Module):
 
             :param config: The configuration for the Latent Diffusion Model, it is a HuggingFace BertConfig object.
         """
+        super().__init__()
         self.diffuser = BertModel(config)
         self.config = config
     
@@ -275,14 +277,44 @@ class TransformerLatentDiffuser(nn.Module):
         return embedding
     
     def forward(self, x_t, t, attention_mask):
-        t_embedding = self._timestep_embedding(t)
+        t_embedding = self._timestep_embedding(t) # (bsz, emb_dim)
+        t_embedding = t_embedding.reshape(t_embedding.size(0), 1, t_embedding.size(1)) # (bsz, 1, emb_dim)
         x_t = x_t + t_embedding
         x_t = nn.functional.normalize(x_t)
-        pred_x_start = self.diffuser(inputs_embeds=x_t, attention_mask=attention_mask)
+        pred_x_start = self.diffuser(inputs_embeds=x_t, attention_mask=attention_mask)['last_hidden_state']
         pred_x_start = nn.functional.normalize(pred_x_start)
         
         return pred_x_start
     
-# Unit Testing 
+# Unit Testing
+def test_transformer_encoder():
+    import torch
+    model = TransformerEncoder('bert-base-cased')
+    
+    d_model = model.encoder.config.hidden_size
+    qd_embeddings = torch.randn((2, 5, d_model))
+    s_embeddings = torch.randn((2, 3, d_model))
+    qd_attention_mask = torch.randint(0, 2, size=(2, 5))
+    s_attention_mask = torch.randint(0, 2, size=(2, 3))
+    
+    output = model(qd_embeddings, s_embeddings, qd_attention_mask, s_attention_mask) 
+    assert output is not None
+    assert output.size() == (2, 8, d_model)
+    
+def test_transformer_diffuser():
+    import torch
+    from transformers import BertConfig
+    
+    config = BertConfig(hidden_size=128, num_attention_heads=8)
+    ldm = TransformerLatentDiffuser(config)
+    
+    x_t = torch.randn((2, 5, 128)) # (bsz, seq_len, emb_dim)
+    t = torch.randint(low=0, high=400, size=(2,)) # (bsz,)
+    attention_mask = torch.randint(low=0, high=2, size=(2, 5)) # (bsz, seq_len)
+    
+    output = ldm(x_t, t, attention_mask)
+    assert output is not None
+    assert output.size() == (2, 5, 128)
+ 
 if __name__ == '__main__':
-    model = DiffusionModel('sqrt', 500)
+    pass
