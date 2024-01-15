@@ -149,16 +149,22 @@ if __name__ == '__main__':
     dataset, sample_splits = load_dataset_and_splits()
     try:
         train_dataset = create_dataset(dataset['train'], sample_splits['train'])
+        with open('cleaned-dataset/train-data.json', 'w') as file:
+            json.dump(train_dataset, file)
     except CleanException as e:
         print(e.message)
         
     try:
         valid_dataset = create_dataset(dataset['train'], sample_splits['valid'])
+        with open('cleaned-dataset/valid-data.json', 'w') as file:
+            json.dump(valid_dataset, file)
     except CleanException as e:
         print(e.message)
         
     try:
         test_dataset = create_dataset(dataset['validation'], sample_splits['test'])
+        with open('cleaned-dataset/test-data.json', 'w') as file:
+            json.dump(test_dataset, file)
     except CleanException as e:
         print(e.message)
         

@@ -6,7 +6,31 @@ from typing import Dict, Callable
 from supervised_contrastive_loss import SupervisedContrastiveLoss
 from transformers import BertModel, BertConfig
 
-class DiffusionModel(nn.Module):
+class _BaseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._log_dict = {}
+        
+    def _update_logs(self, output_dict):
+        for k, v in output_dict.items():
+            output_dict[k] = v.unsqueeze(dim=0).reshape(-1)
+        for k, v in output_dict.items():
+            v = v.detach()
+            existing_log = self._log_dict.get(k, None)
+            if existing_log is None: self._log_dict[k] = v
+            else: 
+                new_log = torch.cat((existing_log, v.to(existing_log.device)), dim=-1).squeeze()
+                self._log_dict[k] = new_log
+    
+    def get_logs(self):
+        for k, v in self._log_dict.items():
+            self._log_dict[k] = torch.mean(v).detach().item()
+        return self._log_dict            
+            
+    def update_parameters_on_step_end(self):
+        self._log_dict = {}
+
+class DiffusionModel(_BaseModel):
     """
         This class acts as the Diffusion Model. It helps in sampling during both forward and backward diffusion.
         The forward diffusion is a simple case, as DDPM (see Ho et al., 2020). The backward diffusion is based on
@@ -246,11 +270,11 @@ class TransformerEncoder(nn.Module):
         
         qd_embeddings = self.encoder(inputs_embeds=qd_embeddings, attention_mask=qd_attention_mask)['last_hidden_state']
         if self._diffusion_emb_dim is not None: qd_embeddings = self.doc_transform(qd_embeddings)
-        qd_embeddings = nn.functional.normalize(qd_embeddings)
+        qd_embeddings = nn.functional.normalize(qd_embeddings, dim=2)
         
         s_embeddings = self.encoder(inputs_embeds=s_embeddings, attention_mask=s_attention_mask)['last_hidden_state']
         if self._diffusion_emb_dim is not None: s_embeddings = self.doc_transform(s_embeddings)
-        s_embeddings = nn.functional.normalize(s_embeddings)
+        s_embeddings = nn.functional.normalize(s_embeddings, dim=2)
         
         return torch.cat((qd_embeddings, s_embeddings), dim=1) # Concat along sequence length dimension
     
@@ -281,8 +305,42 @@ class TransformerLatentDiffuser(nn.Module):
         t_embedding = self._timestep_embedding(t) # (bsz, emb_dim)
         t_embedding = t_embedding.reshape(t_embedding.size(0), 1, t_embedding.size(1)) # (bsz, 1, emb_dim)
         x_t = x_t + t_embedding
-        x_t = nn.functional.normalize(x_t)
+        x_t = nn.functional.normalize(x_t, dim=2)
         pred_x_start = self.diffuser(inputs_embeds=x_t, attention_mask=attention_mask)['last_hidden_state']
-        pred_x_start = nn.functional.normalize(pred_x_start)
+        pred_x_start = nn.functional.normalize(pred_x_start, dim=2)
         
         return pred_x_start
+    
+class NaiveBaseline(_BaseModel):
+    def __init__(self, hf_backbone_name):
+        self.encoder_model = BertModel.from_pretrained(hf_backbone_name)
+        self.config = self.encoder.config
+        num_output_classes_start = 1 # 1 --> either start or not
+        num_output_classes_end = 1 # 1 --> either start or not
+        self._classifier_start_ff = nn.Linear(in_features=self.config.hidden_size, out_features=num_output_classes_start)
+        self._classifier_end_ff = nn.Linear(in_features=self.config.hidden_size, out_features=num_output_classes_end)
+        
+    def forward(self, batch):
+        qd_embeddings, qd_attention_mask, start_labels, end_labels = batch['qd_embeddings'], batch['qd_attention_mask'], batch['start_labels'], batch['end_labels']
+        model_outputs = self.encoder_model(inputs_embeds=qd_embeddings, attention_mask=qd_attention_mask)['last_hidden_state'] # (bsz, qd_seq_len, emb_dim)
+        model_outputs = nn.functional.normalize(model_outputs, dim=2, p=2)
+        contextual_doc_embeddings = model_outputs[:, 1:, :] # The first embedding is for query
+        
+        start_logits = self._classifier_start_ff(contextual_doc_embeddings)\
+            .reshape(contextual_doc_embeddings.size(0), contextual_doc_embeddings.size(1)) # (bsz, seq_len, emb_dim) --> (bsz, seq_len, 1) --> (bsz, seq_len).
+            
+        end_logits = self._classifier_end_ff(contextual_doc_embeddings)\
+            .reshape(contextual_doc_embeddings.size(0), contextual_doc_embeddings.size(1)) # (bsz, seq_len, emb_dim) --> (bsz, seq_len, 1) --> (bsz, seq_len).
+            
+        start_prob_loss = nn.functional.cross_entropy(input=start_logits, target=start_labels)
+        end_prob_loss = nn.functional.cross_entropy(input=end_logits, target=end_labels)
+        
+        output_dict = {
+            'loss': start_prob_loss + end_prob_loss,
+            'start-prob-loss': start_prob_loss,
+            'end-prob-loss': end_prob_loss
+        }
+        
+        self._update_logs(output_dict)
+        
+        return output_dict
