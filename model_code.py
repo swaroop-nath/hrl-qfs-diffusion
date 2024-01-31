@@ -420,7 +420,33 @@ class TransformerLatentDiffuser(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
     
-    def forward(self, x_t, t, attention_mask):
+    def forward(self, **inputs):
+        if self.mode == 'baseline': self.forward_baseline(**inputs)
+        elif self.mode == 'improved-diffusion': self.forward_improved(**inputs)
+        
+    def forward_improved(self, noise, t_from, t_to, t_start, num_qd_sents, attention_mask):
+        # noise.size() == (bsz, num_qd_sents + num_s_sents, emb_dim)
+        # Only the summary sents are noise
+        t_from_embedding = self._timestep_embedding(t_from).to(noise.device)
+        t_from_embedding = t_from_embedding.reshape(t_from_embedding.size(0), 1, t_from_embedding.size(1)) # (bsz, 1, emb_dim)
+        
+        t_to_embedding = self._timestep_embedding(t_to).to(noise.device)
+        t_to_embedding = t_to_embedding.reshape(t_to_embedding.size(0), 1, t_to_embedding.size(1)) # (bsz, 1, emb_dim)
+        
+        t_start_embedding = self._timestep_embedding(t_start).to(noise.device)
+        t_start_embedding = t_start_embedding.reshape(t_start_embedding.size(0), 1, t_start_embedding.size(1)) # (bsz, 1, emb_dim)
+        
+        noise_to_t = noise + t_from + t_to
+        pred_x_t = self.diffuser(input_embeds=noise_to_t, attention_mask=attention_mask)['last_hidden_state']
+        pred_x_t[:, :num_qd_sents, :] = noise[:, :num_qd_sents, :] # Having the query-document part same as before -- conditional diffusion
+        
+        pred_x_to_start = pred_x_t + t_to + t_start
+        pred_x_start = self.diffuser(input_embeds=pred_x_to_start, attention_mask=attention_mask)['last_hidden_state']
+        pred_x_start[:, :num_qd_sents, :] = noise[:, :num_qd_sents, :]
+        
+        return pred_x_start, pred_x_t
+    
+    def forward_baseline(self, x_t, t, attention_mask):
         t_embedding = self._timestep_embedding(t).to(x_t.device) # (bsz, emb_dim)
         t_embedding = t_embedding.reshape(t_embedding.size(0), 1, t_embedding.size(1)) # (bsz, 1, emb_dim)
         x_t = x_t + t_embedding
