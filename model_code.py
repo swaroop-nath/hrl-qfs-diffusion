@@ -275,7 +275,7 @@ class DiffusionModel(_BaseModel):
         x_t[:, :num_qd_sents, :] = x_start_in[:, :num_qd_sents, :] # The input qd sents should not change, the diffuser needs to learn to condition on the virgin qd sents
         
         qds_mask = torch.cat((qd_attention_mask, s_attention_mask), dim=1)
-        pred_x_start = self.backbone(x_t, t, qds_mask)
+        pred_x_start = self.backbone(**{'x_t': x_t, 't': t, 'attention_mask': qds_mask})
         pred_x_start[:, :num_qd_sents, :] = x_start_in[:, :num_qd_sents, :] # The input qd sents should not change, the diffuser needs to learn to condition on the virgin qd sents
         
         contrastive_loss = self._contrastive_loss(x_start_in, contrastive_labels)
@@ -407,6 +407,7 @@ class TransformerLatentDiffuser(nn.Module):
         if isinstance(config, BartConfig): self.diffuser = BartModel(config).encoder
         elif isinstance(config, BertConfig): self.diffuser = BertModel(config)
         self.config = config
+        self.mode = 'baseline'
     
     def _timestep_embedding(self, timesteps, max_period=10000):
         dim = self.config.hidden_size
@@ -421,8 +422,8 @@ class TransformerLatentDiffuser(nn.Module):
         return embedding
     
     def forward(self, **inputs):
-        if self.mode == 'baseline': self.forward_baseline(**inputs)
-        elif self.mode == 'improved-diffusion': self.forward_improved(**inputs)
+        if self.mode == 'baseline': return self.forward_baseline(**inputs)
+        elif self.mode == 'improved-diffusion': return self.forward_improved(**inputs)
         
     def forward_improved(self, noise, t_from, t_to, t_start, num_qd_sents, attention_mask):
         # noise.size() == (bsz, num_qd_sents + num_s_sents, emb_dim)
